@@ -1,0 +1,487 @@
+#!/usr/bin/env python3
+"""備份／匯出／匯入 iTerm2 profiles（Preferences plist）與對應的登入腳本，支援同名覆蓋。"""
+import argparse
+import difflib
+import json
+import plistlib
+import shutil
+import subprocess
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+PLIST_DOMAIN = "com.googlecode.iterm2"
+SCRIPT_DIR = Path.home() / "auto_login_ssh"
+BACKUP_ROOT = Path(__file__).resolve().parent / "backup"
+
+
+# ---------- 核心邏輯（不做 IO，方便測試） ----------
+
+def find_bookmark(bookmarks, name):
+    for i, b in enumerate(bookmarks):
+        if b.get("Name") == name:
+            return i
+    return None
+
+
+def duplicate_names(bookmarks):
+    seen, dupes = {}, {}
+    for b in bookmarks:
+        name = b.get("Name")
+        seen.setdefault(name, []).append(b.get("Guid"))
+    for name, guids in seen.items():
+        if len(guids) > 1:
+            dupes[name] = guids
+    return dupes
+
+
+def merge_bookmark(old, new):
+    merged = dict(new)
+    merged["Guid"] = old.get("Guid", merged.get("Guid"))
+    return merged
+
+
+def script_source_path(profile):
+    """Initial Text 展開 ~ 後的絕對路徑，沒填就回 None（不管檔案在哪個資料夾）"""
+    text = profile.get("Initial Text", "")
+    if not text:
+        return None
+    return Path(text.strip()).expanduser()
+
+
+def bundle_script_key(profile, script_dir):
+    """回傳 (bundle 內存放用的相對路徑, 是否落在 script_dir 追蹤範圍內)
+
+    在 script_dir 底下的腳本用乾淨的相對路徑（例如 gf1prod/x.sh），方便套用
+    --script-dir 改寫規則；不在裡面的腳本一樣要備份，收進 scripts/_other/ 底下，
+    用去掉開頭 / 的完整路徑攤平存放，避免跟追蹤範圍內的相對路徑撞名。
+    """
+    path = script_source_path(profile)
+    if path is None:
+        return None, False
+    try:
+        return path.resolve().relative_to(script_dir.resolve()), True
+    except ValueError:
+        return Path("_other", *path.resolve().parts[1:]), False
+
+
+def rewrite_initial_text(profile, relpath, script_dir):
+    home = Path.home()
+    try:
+        prefix = script_dir.resolve().relative_to(home)
+        new_path = f"~/{prefix}/{relpath}"
+    except ValueError:
+        new_path = str(script_dir / relpath)
+    profile = dict(profile)
+    profile["Initial Text"] = new_path
+    return profile
+
+
+def diff_profiles(old, new):
+    old_text = json.dumps(old, indent=2, sort_keys=True, default=str).splitlines(keepends=True)
+    new_text = json.dumps(new, indent=2, sort_keys=True, default=str).splitlines(keepends=True)
+    return "".join(difflib.unified_diff(old_text, new_text, "舊", "新"))
+
+
+def diff_script(old_bytes, new_bytes):
+    if old_bytes == new_bytes:
+        return ""
+    old_text = old_bytes.decode(errors="replace").splitlines(keepends=True)
+    new_text = new_bytes.decode(errors="replace").splitlines(keepends=True)
+    return "".join(difflib.unified_diff(old_text, new_text, "舊腳本", "新腳本"))
+
+
+# ---------- IO（呼叫 defaults / 動到檔案，selftest 會注入假的版本） ----------
+
+def read_bookmarks(domain):
+    out = subprocess.run(["defaults", "export", domain, "-"], capture_output=True, check=True).stdout
+    data = plistlib.loads(out)
+    return data, data.get("New Bookmarks", [])
+
+
+def write_bookmarks(domain, full_data):
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".plist", delete=False) as f:
+        f.write(plistlib.dumps(full_data))
+        tmp_path = f.name
+    try:
+        subprocess.run(["defaults", "import", domain, tmp_path], check=True)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def iterm_is_running():
+    return subprocess.run(["pgrep", "-x", "iTerm2"], capture_output=True).returncode == 0
+
+
+def warn_if_iterm_running():
+    if not iterm_is_running():
+        return True
+    print("警告：iTerm2 正在執行中。匯入會用讀取到的舊快照整個覆蓋偏好設定，")
+    print("如果你剛剛在 iTerm2 裡動過其他設定，這次匯入可能會把它蓋掉。")
+    print("建議先完全結束 iTerm2（Cmd+Q）再匯入。")
+    return input("仍要繼續嗎？[y/N] ").strip().lower() == "y"
+
+
+def lock_down(path):
+    for p in path.rglob("*"):
+        p.chmod(0o700 if p.is_dir() else 0o600)
+    path.chmod(0o700)
+
+
+# ---------- bundle 讀寫（backup 與 export 共用） ----------
+
+def write_bundle(out_dir, bookmarks, script_dir):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "profiles.json").write_text(json.dumps({"Profiles": bookmarks}, indent=2))
+    for profile in bookmarks:
+        src = script_source_path(profile)
+        if src is None or not src.exists():
+            continue
+        key, _tracked = bundle_script_key(profile, script_dir)
+        dest = out_dir / "scripts" / key
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+
+
+def cmd_backup(domain, script_dir):
+    _, bookmarks = read_bookmarks(domain)
+    dest = BACKUP_ROOT / datetime.now().strftime("%Y%m%d-%H%M%S")
+    write_bundle(dest, bookmarks, script_dir)
+    lock_down(dest)
+    print(f"已備份 {len(bookmarks)} 個 profile 至 {dest}")
+    return dest
+
+
+def cmd_list(domain, script_dir):
+    _, bookmarks = read_bookmarks(domain)
+    for b in bookmarks:
+        src = script_source_path(b)
+        flag = ""
+        if src is not None:
+            if not src.exists():
+                flag = "  ⚠ 找不到登入腳本"
+            else:
+                _key, tracked = bundle_script_key(b, script_dir)
+                if not tracked:
+                    flag = "  ℹ 腳本不在追蹤資料夾內，仍會一併備份"
+        print(f"{b.get('Name', '<無名稱>')}\t{b.get('Guid')}{flag}")
+
+    for name, guids in duplicate_names(bookmarks).items():
+        print(f"⚠ 重複名稱「{name}」：{', '.join(guids)}（匯入時只會比對到第一筆）")
+    return bookmarks
+
+
+def cmd_export(domain, names, out_dir, script_dir):
+    _, bookmarks = read_bookmarks(domain)
+    by_name = {b.get("Name"): b for b in bookmarks}
+    missing = [n for n in names if n not in by_name]
+    if missing:
+        sys.exit(f"找不到以下 profile：{', '.join(missing)}")
+    write_bundle(out_dir, [by_name[n] for n in names], script_dir)
+    print(f"已匯出 {len(names)} 個 profile 至 {out_dir}")
+
+
+def cmd_import(domain, bundle_dir, script_dir, confirm=None, skip_running_check=False):
+    if confirm is None:
+        def confirm(name, diff_text):
+            print(f"\n=== 「{name}」發現差異 ===\n{diff_text}")
+            return input(f"要覆蓋「{name}」嗎？[y/N] ").strip().lower() == "y"
+
+    if not skip_running_check and not warn_if_iterm_running():
+        print("已取消")
+        return
+
+    incoming = json.loads((bundle_dir / "profiles.json").read_text()).get("Profiles", [])
+    full_data, bookmarks = read_bookmarks(domain)
+    changed = False
+
+    for profile in incoming:
+        name = profile.get("Name")
+        key, tracked = bundle_script_key(profile, script_dir)
+        incoming_script = None
+        if key is not None:
+            src = bundle_dir / "scripts" / key
+            if src.exists():
+                incoming_script = src.read_bytes()
+        # tracked：還原到（可能覆寫過的）script_dir/key；不在追蹤範圍內：還原回原本記錄的絕對路徑
+        restore_to = (script_dir / key) if tracked else script_source_path(profile)
+
+        index = find_bookmark(bookmarks, name)
+        if index is None:
+            new_profile = dict(profile)
+            new_profile.setdefault("Guid", str(uuid.uuid4()).upper())
+            if tracked:
+                new_profile = rewrite_initial_text(new_profile, key, script_dir)
+            bookmarks.append(new_profile)
+            if incoming_script is not None:
+                restore_to.parent.mkdir(parents=True, exist_ok=True)
+                restore_to.write_bytes(incoming_script)
+            changed = True
+            print(f"「{name}」：沒有同名 profile，已新增")
+            continue
+
+        old_profile = bookmarks[index]
+        merged = merge_bookmark(old_profile, profile)
+        if tracked:
+            merged = rewrite_initial_text(merged, key, script_dir)
+
+        profile_diff = diff_profiles(old_profile, merged)
+        script_diff = ""
+        if key is not None:
+            old_script = restore_to.read_bytes() if restore_to.exists() else b""
+            if incoming_script is not None:
+                script_diff = diff_script(old_script, incoming_script)
+
+        if not profile_diff and not script_diff:
+            print(f"「{name}」：沒有差異，略過")
+            continue
+
+        diff_text = (profile_diff + ("\n" + script_diff if script_diff else "")) or "（沒有差異）"
+        if not confirm(name, diff_text):
+            print(f"「{name}」：已略過")
+            continue
+
+        bookmarks[index] = merged
+        if incoming_script is not None:
+            restore_to.parent.mkdir(parents=True, exist_ok=True)
+            restore_to.write_bytes(incoming_script)
+        changed = True
+        print(f"「{name}」：已覆蓋（保留原 Guid）")
+
+    if not changed:
+        print("沒有任何變更，略過寫回")
+        return
+
+    full_data["New Bookmarks"] = bookmarks
+    write_bookmarks(domain, full_data)
+
+
+def browse_for_bundle(start_dir):
+    """數字選單瀏覽資料夾找 bundle（含 profiles.json 的資料夾），取代手動打完整路徑。"""
+    current = start_dir if start_dir.is_dir() else Path.cwd()
+    while True:
+        is_bundle = (current / "profiles.json").exists()
+        subdirs = sorted(p for p in current.iterdir() if p.is_dir())
+        print(f"\n目前位置：{current}")
+        if is_bundle:
+            print("0) 使用這個資料夾")
+        for idx, d in enumerate(subdirs, 1):
+            print(f"{idx}) {d.name}/")
+        print("..) 上一層　路徑) 直接輸入路徑跳過去")
+        choice = input("> ").strip()
+        if choice == "0" and is_bundle:
+            return current
+        if choice == "..":
+            current = current.parent
+        elif choice.isdigit() and 1 <= int(choice) <= len(subdirs):
+            current = subdirs[int(choice) - 1]
+        elif choice:
+            candidate = Path(choice).expanduser()
+            if candidate.is_dir():
+                current = candidate
+            else:
+                print("找不到這個路徑")
+
+
+def interactive_menu(domain, script_dir):
+    while True:
+        print("\n1) 備份\n2) 列出 profiles\n3) 匯出\n4) 匯入\n5) 離開")
+        choice = input("請選擇 > ").strip()
+        if choice == "1":
+            cmd_backup(domain, script_dir)
+        elif choice == "2":
+            cmd_list(domain, script_dir)
+        elif choice == "3":
+            _, bookmarks = read_bookmarks(domain)
+            for idx, b in enumerate(bookmarks, 1):
+                print(f"{idx}) {b.get('Name')}")
+            picked = input("請輸入要匯出的編號（空格分隔）：").split()
+            names = [bookmarks[int(i) - 1].get("Name") for i in picked]
+            out = input("輸出資料夾 [export]：").strip() or "export"
+            cmd_export(domain, names, Path(out), script_dir)
+        elif choice == "4":
+            bundle_dir = browse_for_bundle(BACKUP_ROOT)
+            cmd_import(domain, bundle_dir, script_dir)
+        elif choice == "5":
+            return
+        else:
+            print("無效的選項")
+
+
+def selftest():
+    import tempfile
+
+    def fake_read(store):
+        return store[0], store[0]["New Bookmarks"]
+
+    def fake_write(store):
+        def _write(domain, full_data):
+            store[0] = full_data
+        return _write
+
+    with tempfile.TemporaryDirectory() as tmp:
+        script_dir = Path(tmp) / "scripts"
+        script_dir.mkdir()
+        (script_dir / "grp").mkdir()
+        (script_dir / "grp" / "work.sh").write_text("echo old\n")
+
+        store = [{
+            "Other Setting": "keep-me",
+            "New Bookmarks": [
+                {"Name": "Work", "Guid": "guid-work", "Initial Text": "~/scripts-placeholder",
+                 "Foreground": "white"},
+            ],
+        }]
+        # Initial Text 用相對於 script_dir 的實際路徑（模擬 ~ 展開後落在 script_dir 底下）
+        store[0]["New Bookmarks"][0]["Initial Text"] = str(script_dir / "grp" / "work.sh")
+
+        global read_bookmarks, write_bookmarks
+        real_read, real_write = read_bookmarks, write_bookmarks
+        read_bookmarks = lambda domain: fake_read(store)
+        write_bookmarks = fake_write(store)
+
+        try:
+            # find / merge 保留 Guid
+            assert find_bookmark(store[0]["New Bookmarks"], "Work") == 0
+            assert find_bookmark(store[0]["New Bookmarks"], "Nope") is None
+            merged = merge_bookmark(store[0]["New Bookmarks"][0], {"Name": "Work", "Foreground": "black"})
+            assert merged["Guid"] == "guid-work" and merged["Foreground"] == "black"
+
+            # bundle_script_key 抓出子資料夾相對路徑，且判定為 tracked
+            key, tracked = bundle_script_key(store[0]["New Bookmarks"][0], script_dir)
+            assert key == Path("grp/work.sh") and tracked is True
+
+            # export bundle 結構
+            export_dir = Path(tmp) / "export1"
+            cmd_export("fake", ["Work"], export_dir, script_dir)
+            assert (export_dir / "profiles.json").exists()
+            assert (export_dir / "scripts" / "grp" / "work.sh").exists()
+
+            # import 覆蓋同名：profile 與腳本都换新，Guid 保留
+            bundle = Path(tmp) / "bundle-update"
+            bundle.mkdir()
+            (bundle / "profiles.json").write_text(json.dumps({"Profiles": [
+                {"Name": "Work", "Initial Text": str(script_dir / "grp" / "work.sh"), "Foreground": "black"}
+            ]}))
+            (bundle / "scripts" / "grp").mkdir(parents=True)
+            (bundle / "scripts" / "grp" / "work.sh").write_text("echo new\n")
+            cmd_import("fake", bundle, script_dir, confirm=lambda n, d: True, skip_running_check=True)
+            updated = find_bookmark(store[0]["New Bookmarks"], "Work")
+            assert store[0]["New Bookmarks"][updated]["Guid"] == "guid-work"
+            assert store[0]["New Bookmarks"][updated]["Foreground"] == "black"
+            assert (script_dir / "grp" / "work.sh").read_text() == "echo new\n"
+            assert store[0]["Other Setting"] == "keep-me"
+
+            # profile 欄位相同、只有腳本內容變了，也要能觸發詢問
+            bundle2 = Path(tmp) / "bundle-script-only"
+            bundle2.mkdir()
+            current = dict(store[0]["New Bookmarks"][updated])
+            (bundle2 / "profiles.json").write_text(json.dumps({"Profiles": [current]}))
+            (bundle2 / "scripts" / "grp").mkdir(parents=True)
+            (bundle2 / "scripts" / "grp" / "work.sh").write_text("echo changed-password\n")
+            asked = []
+            cmd_import("fake", bundle2, script_dir,
+                       confirm=lambda n, d: asked.append(d) or True, skip_running_check=True)
+            assert asked, "腳本內容變更應該要觸發詢問"
+            assert (script_dir / "grp" / "work.sh").read_text() == "echo changed-password\n"
+
+            # 拒絕覆蓋維持原狀
+            bundle3 = Path(tmp) / "bundle-declined"
+            bundle3.mkdir()
+            (bundle3 / "profiles.json").write_text(json.dumps({"Profiles": [
+                {"Name": "Work", "Initial Text": str(script_dir / "grp" / "work.sh"), "Foreground": "red"}
+            ]}))
+            cmd_import("fake", bundle3, script_dir, confirm=lambda n, d: False, skip_running_check=True)
+            unchanged = store[0]["New Bookmarks"][find_bookmark(store[0]["New Bookmarks"], "Work")]
+            assert unchanged["Foreground"] == "black"
+
+            # 新名稱 -> append，分配大寫 Guid，本機既有 profile 不受影響（不會被刪除）
+            bundle4 = Path(tmp) / "bundle-new"
+            bundle4.mkdir()
+            (bundle4 / "profiles.json").write_text(json.dumps({"Profiles": [{"Name": "Personal"}]}))
+            before_count = len(store[0]["New Bookmarks"])
+            cmd_import("fake", bundle4, script_dir, skip_running_check=True)
+            assert len(store[0]["New Bookmarks"]) == before_count + 1
+            personal = store[0]["New Bookmarks"][find_bookmark(store[0]["New Bookmarks"], "Personal")]
+            assert len(personal["Guid"]) == 36 and personal["Guid"] == personal["Guid"].upper()
+            assert find_bookmark(store[0]["New Bookmarks"], "Work") is not None
+
+            # --script-dir 不同於來源時，Initial Text 要被改寫
+            other_script_dir = Path(tmp) / "other-scripts"
+            other_script_dir.mkdir()
+            rewritten = rewrite_initial_text(
+                {"Name": "Work"}, Path("grp/work.sh"), other_script_dir
+            )
+            assert rewritten["Initial Text"] == str(other_script_dir / "grp" / "work.sh")
+
+            # 重複名稱偵測
+            dupes = duplicate_names([
+                {"Name": "A", "Guid": "1"}, {"Name": "A", "Guid": "2"}, {"Name": "B", "Guid": "3"},
+            ])
+            assert dupes == {"A": ["1", "2"]}
+
+            # 腳本不在 script_dir 追蹤範圍內，也要能備份／匯入回原路徑
+            outside_dir = Path(tmp) / "elsewhere"
+            outside_dir.mkdir()
+            (outside_dir / "custom.sh").write_text("echo outside\n")
+            outside_profile = {
+                "Name": "Outside", "Guid": "guid-outside",
+                "Initial Text": str(outside_dir / "custom.sh"),
+            }
+            key2, tracked2 = bundle_script_key(outside_profile, script_dir)
+            assert tracked2 is False and str(key2).startswith("_other")
+
+            export_dir2 = Path(tmp) / "export2"
+            write_bundle(export_dir2, [outside_profile], script_dir)
+            assert (export_dir2 / "scripts" / key2).read_text() == "echo outside\n"
+
+            (outside_dir / "custom.sh").write_text("echo outside changed\n")
+            store[0]["New Bookmarks"].append(outside_profile)
+            cmd_import("fake", export_dir2, script_dir, confirm=lambda n, d: True, skip_running_check=True)
+            assert (outside_dir / "custom.sh").read_text() == "echo outside\n"
+        finally:
+            read_bookmarks, write_bookmarks = real_read, real_write
+
+    print("自我檢查通過")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--domain", default=PLIST_DOMAIN, help="plist domain")
+    parser.add_argument("--script-dir", type=Path, default=SCRIPT_DIR, help="登入腳本目錄")
+    parser.add_argument("--selftest", action="store_true", help="執行自我檢查後結束")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("backup", help="備份全部 profile 與對應腳本")
+    sub.add_parser("list", help="列出目前所有 profile")
+
+    p_export = sub.add_parser("export", help="匯出指定名稱的 profile 與對應腳本")
+    p_export.add_argument("names", nargs="+", help="要匯出的 profile 名稱")
+    p_export.add_argument("-o", "--output", type=Path, default=None, help="輸出資料夾路徑")
+
+    p_import = sub.add_parser("import", help="匯入 profile／腳本，遇到差異會提示是否覆蓋")
+    p_import.add_argument("bundle", type=Path, help="要匯入的 bundle 資料夾")
+
+    args = parser.parse_args()
+
+    if args.selftest:
+        selftest()
+        return
+
+    if args.command == "backup":
+        cmd_backup(args.domain, args.script_dir)
+    elif args.command == "list":
+        cmd_list(args.domain, args.script_dir)
+    elif args.command == "export":
+        out = args.output or Path(f"iterm2-export-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+        cmd_export(args.domain, args.names, out, args.script_dir)
+    elif args.command == "import":
+        cmd_import(args.domain, args.bundle, args.script_dir)
+    else:
+        interactive_menu(args.domain, args.script_dir)
+
+
+if __name__ == "__main__":
+    main()
