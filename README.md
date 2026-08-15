@@ -4,7 +4,7 @@
 
 處理的是 **Preferences plist**（`com.googlecode.iterm2` domain 底下的 `New Bookmarks`），透過 `defaults export`/`defaults import` 讀寫，而不是 Dynamic Profiles。每個 profile 若有 `Initial Text` 指向 `~/auto_login_ssh/` 底下的自動登入腳本（例如 `~/auto_login_ssh/gf1prod/xxx.sh`），備份/匯出/匯入時會連腳本一起處理。
 
-> ⚠️ **這些登入腳本裡通常明碼寫著 SSH 密碼**。`backup`/`export` 產生的資料夾請不要上傳雲端、分享或加進版本控制 —— 專案已用 `.gitignore` 排除 `backup/` 與 `iterm2-export-*/`，但你自訂輸出路徑時要自己注意。
+> ⚠️ **這些登入腳本裡通常明碼寫著 SSH 密碼**。`backup`/`export` 產生的 zip 請不要上傳雲端、分享或加進版本控制 —— 專案已用 `.gitignore` 排除 `backup/` 與 `iterm2-export-*`，但你自訂輸出路徑時要自己注意。
 
 ## 安裝
 
@@ -28,24 +28,27 @@ chmod +x iterm2-profiles
 5) 離開
 ```
 
-選「4) 匯入」時會從 `backup/` 資料夾開始，用數字選單瀏覽子資料夾（輸入編號進入、`..` 回上一層、或直接貼路徑跳過去），找到含 `profiles.json` 的資料夾後選 `0) 使用這個資料夾` 即可，不用手動打完整路徑。
+選「4) 匯入」時會列出 `backup/` 資料夾底下所有可用的備份（`.zip` 或含 `profiles.json` 的資料夾），依新到舊編號，輸入編號選擇即可，不用手動打完整路徑。
 
 也可以直接下指令：
 
 ```bash
-./iterm2-profiles backup                        # 備份全部 profile + 對應腳本到 backup/<時間戳記>/
+./iterm2-profiles backup                        # 備份全部 profile + 對應腳本，壓成 backup/<時間戳記>.zip
 ./iterm2-profiles list                           # 列出所有 profile，標出缺腳本／重複名稱
-./iterm2-profiles export gf_alfa2 gf_xj_api -o out_dir   # 匯出指定名稱的 profile + 對應腳本
-./iterm2-profiles import out_dir                 # 匯入，遇到差異會顯示並詢問是否覆蓋
+./iterm2-profiles export gf_alfa2 gf_xj_api -o out_dir   # 匯出指定名稱的 profile + 對應腳本，壓成 out_dir.zip
+./iterm2-profiles import                         # 不帶路徑：從 backup/ 列表選一個匯入
+./iterm2-profiles import out_dir.zip             # 或直接指定 bundle 路徑（.zip 或資料夾皆可），遇到差異會顯示並詢問是否覆蓋
 ```
+
+`backup`/`export` 完成後只留下 `.zip`，中間產生的明文資料夾會自動刪除，避免腳本裡的明文密碼在硬碟上多一份副本。
 
 ## 換機器 / 還原
 
-`backup` 跟 `export` 產生的是同一種 bundle 格式（`profiles.json` + `scripts/<相對路徑>`）。換一台機器時：
+`backup` 跟 `export` 產生的是同一種 bundle 格式（`profiles.json` + `scripts/<相對路徑>`），最後都壓成一個 `.zip`。換一台機器時：
 
 1. 原機器：`./iterm2-profiles backup`
-2. 把 `backup/<時間戳>/` 整個資料夾複製過去（USB / AirDrop / 私有 git repo，**不要用一般雲端同步**）
-3. 新機器：`./iterm2-profiles import backup/<時間戳>/`
+2. 把 `backup/<時間戳>.zip` 複製過去（USB / AirDrop / 私有 git repo，**不要用一般雲端同步**）
+3. 新機器：把 zip 放進 `backup/` 資料夾後執行 `./iterm2-profiles import`（從列表選）或直接 `./iterm2-profiles import <路徑>.zip`
 
 ## 腳本不在追蹤的腳本目錄裡也沒關係
 

@@ -7,7 +7,9 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import tempfile
 import uuid
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -101,7 +103,6 @@ def read_bookmarks(domain):
 
 
 def write_bookmarks(domain, full_data):
-    import tempfile
     with tempfile.NamedTemporaryFile(suffix=".plist", delete=False) as f:
         f.write(plistlib.dumps(full_data))
         tmp_path = f.name
@@ -145,13 +146,25 @@ def write_bundle(out_dir, bookmarks, script_dir):
         shutil.copy2(src, dest)
 
 
+def write_bundle_zip(out_dir, bookmarks, script_dir):
+    """跟 write_bundle 一樣建 bundle，但壓成 <out_dir>.zip 後把明文資料夾刪掉（腳本含明文密碼，不留兩份）。"""
+    write_bundle(out_dir, bookmarks, script_dir)
+    lock_down(out_dir)
+    zip_path = out_dir.with_suffix(".zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in out_dir.rglob("*"):
+            if f.is_file():
+                zf.write(f, f.relative_to(out_dir))
+    shutil.rmtree(out_dir)
+    return zip_path
+
+
 def cmd_backup(domain, script_dir):
     _, bookmarks = read_bookmarks(domain)
     dest = BACKUP_ROOT / datetime.now().strftime("%Y%m%d-%H%M%S")
-    write_bundle(dest, bookmarks, script_dir)
-    lock_down(dest)
-    print(f"已備份 {len(bookmarks)} 個 profile 至 {dest}")
-    return dest
+    zip_path = write_bundle_zip(dest, bookmarks, script_dir)
+    print(f"已備份 {len(bookmarks)} 個 profile 至 {zip_path}")
+    return zip_path
 
 
 def cmd_list(domain, script_dir):
@@ -179,11 +192,24 @@ def cmd_export(domain, names, out_dir, script_dir):
     missing = [n for n in names if n not in by_name]
     if missing:
         sys.exit(f"找不到以下 profile：{', '.join(missing)}")
-    write_bundle(out_dir, [by_name[n] for n in names], script_dir)
-    print(f"已匯出 {len(names)} 個 profile 至 {out_dir}")
+    zip_path = write_bundle_zip(out_dir, [by_name[n] for n in names], script_dir)
+    print(f"已匯出 {len(names)} 個 profile 至 {zip_path}")
+    return zip_path
 
 
 def cmd_import(domain, bundle_dir, script_dir, confirm=None, skip_running_check=False):
+    if bundle_dir.is_file() and bundle_dir.suffix == ".zip":
+        tmp_dir = Path(tempfile.mkdtemp(prefix="iterm2-import-"))
+        try:
+            with zipfile.ZipFile(bundle_dir) as zf:
+                zf.extractall(tmp_dir)
+            found = next(tmp_dir.rglob("profiles.json"), None)
+            if found is None:
+                sys.exit(f"{bundle_dir}：zip 裡找不到 profiles.json，不是合法的 bundle")
+            return cmd_import(domain, found.parent, script_dir, confirm, skip_running_check)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     if confirm is None:
         def confirm(name, diff_text):
             print(f"\n=== 「{name}」發現差異 ===\n{diff_text}")
@@ -258,31 +284,28 @@ def cmd_import(domain, bundle_dir, script_dir, confirm=None, skip_running_check=
     write_bookmarks(domain, full_data)
 
 
-def browse_for_bundle(start_dir):
-    """數字選單瀏覽資料夾找 bundle（含 profiles.json 的資料夾），取代手動打完整路徑。"""
-    current = start_dir if start_dir.is_dir() else Path.cwd()
-    while True:
-        is_bundle = (current / "profiles.json").exists()
-        subdirs = sorted(p for p in current.iterdir() if p.is_dir())
-        print(f"\n目前位置：{current}")
-        if is_bundle:
-            print("0) 使用這個資料夾")
-        for idx, d in enumerate(subdirs, 1):
-            print(f"{idx}) {d.name}/")
-        print("..) 上一層　路徑) 直接輸入路徑跳過去")
-        choice = input("> ").strip()
-        if choice == "0" and is_bundle:
-            return current
-        if choice == "..":
-            current = current.parent
-        elif choice.isdigit() and 1 <= int(choice) <= len(subdirs):
-            current = subdirs[int(choice) - 1]
-        elif choice:
-            candidate = Path(choice).expanduser()
-            if candidate.is_dir():
-                current = candidate
-            else:
-                print("找不到這個路徑")
+def list_backup_bundles(backup_root):
+    """backup_root 底下可用的 bundle，新到舊排序：含 profiles.json 的資料夾，或 .zip 檔。"""
+    if not backup_root.is_dir():
+        return []
+    entries = [
+        p for p in backup_root.iterdir()
+        if (p.is_dir() and (p / "profiles.json").exists()) or (p.is_file() and p.suffix == ".zip")
+    ]
+    return sorted(entries, key=lambda p: p.name, reverse=True)
+
+
+def choose_backup_bundle(backup_root):
+    """列出 backup_root 底下的備份讓使用者用編號選，回傳選中的路徑（資料夾或 zip）。"""
+    entries = list_backup_bundles(backup_root)
+    if not entries:
+        sys.exit(f"{backup_root} 底下沒有可用的備份，請用 import <路徑> 手動指定")
+    for idx, p in enumerate(entries, 1):
+        print(f"{idx}) {p.name}")
+    choice = input("請選擇要匯入的備份編號 > ").strip()
+    if not choice.isdigit() or not (1 <= int(choice) <= len(entries)):
+        sys.exit("編號無效")
+    return entries[int(choice) - 1]
 
 
 def interactive_menu(domain, script_dir):
@@ -302,8 +325,7 @@ def interactive_menu(domain, script_dir):
             out = input("輸出資料夾 [export]：").strip() or "export"
             cmd_export(domain, names, Path(out), script_dir)
         elif choice == "4":
-            bundle_dir = browse_for_bundle(BACKUP_ROOT)
-            cmd_import(domain, bundle_dir, script_dir)
+            cmd_import(domain, choose_backup_bundle(BACKUP_ROOT), script_dir)
         elif choice == "5":
             return
         else:
@@ -353,11 +375,19 @@ def selftest():
             key, tracked = bundle_script_key(store[0]["New Bookmarks"][0], script_dir)
             assert key == Path("grp/work.sh") and tracked is True
 
-            # export bundle 結構
+            # export 壓成 zip，明文資料夾不留
             export_dir = Path(tmp) / "export1"
-            cmd_export("fake", ["Work"], export_dir, script_dir)
-            assert (export_dir / "profiles.json").exists()
-            assert (export_dir / "scripts" / "grp" / "work.sh").exists()
+            export_zip = cmd_export("fake", ["Work"], export_dir, script_dir)
+            assert export_zip == export_dir.with_suffix(".zip")
+            assert not export_dir.exists()
+            with zipfile.ZipFile(export_zip) as zf:
+                names = zf.namelist()
+            assert "profiles.json" in names
+            assert "scripts/grp/work.sh" in names
+
+            # import 也吃 zip：解壓到臨時目錄匯入（跟匯出當下沒有差異，應該直接略過不報錯）
+            cmd_import("fake", export_zip, script_dir, skip_running_check=True)
+            assert find_bookmark(store[0]["New Bookmarks"], "Work") == 0
 
             # import 覆蓋同名：profile 與腳本都换新，Guid 保留
             bundle = Path(tmp) / "bundle-update"
@@ -441,6 +471,17 @@ def selftest():
             store[0]["New Bookmarks"].append(outside_profile)
             cmd_import("fake", export_dir2, script_dir, confirm=lambda n, d: True, skip_running_check=True)
             assert (outside_dir / "custom.sh").read_text() == "echo outside\n"
+
+            # list_backup_bundles：新到舊排序，只認含 profiles.json 的資料夾或 .zip，雜項忽略
+            fake_backup_root = Path(tmp) / "fake-backup-root"
+            fake_backup_root.mkdir()
+            (fake_backup_root / "20260101-000000").mkdir()
+            (fake_backup_root / "20260101-000000" / "profiles.json").write_text("{}")
+            (fake_backup_root / "20260301-000000.zip").write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+            (fake_backup_root / "not-a-bundle").mkdir()
+            (fake_backup_root / "random.txt").write_text("junk")
+            listed = list_backup_bundles(fake_backup_root)
+            assert [p.name for p in listed] == ["20260301-000000.zip", "20260101-000000"]
         finally:
             read_bookmarks, write_bookmarks = real_read, real_write
 
@@ -462,7 +503,8 @@ def main():
     p_export.add_argument("-o", "--output", type=Path, default=None, help="輸出資料夾路徑")
 
     p_import = sub.add_parser("import", help="匯入 profile／腳本，遇到差異會提示是否覆蓋")
-    p_import.add_argument("bundle", type=Path, help="要匯入的 bundle 資料夾")
+    p_import.add_argument("bundle", type=Path, nargs="?", default=None,
+                           help="要匯入的 bundle 資料夾或 zip（省略則從 backup/ 選擇）")
 
     args = parser.parse_args()
 
@@ -478,7 +520,8 @@ def main():
         out = args.output or Path(f"iterm2-export-{datetime.now().strftime('%Y%m%d-%H%M%S')}")
         cmd_export(args.domain, args.names, out, args.script_dir)
     elif args.command == "import":
-        cmd_import(args.domain, args.bundle, args.script_dir)
+        bundle = args.bundle or choose_backup_bundle(BACKUP_ROOT)
+        cmd_import(args.domain, bundle, args.script_dir)
     else:
         interactive_menu(args.domain, args.script_dir)
 
