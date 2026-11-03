@@ -223,12 +223,13 @@ def _pick(stdscr, title, items, multi):
     while True:
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        stdscr.addnstr(0, 0, f"{title}（{hint}）", w - 1)
-        rows = max(1, h - 1)
+        stdscr.addnstr(0, 0, title, w - 1)
+        stdscr.addnstr(1, 0, hint, w - 1, curses.A_DIM)
+        rows = max(1, h - 2)
         top = min(max(top, cur - rows + 1), cur)
         for i in range(top, min(len(items), top + rows)):
             mark = ("[x] " if sel[i] else "[ ] ") if multi else "  "
-            stdscr.addnstr(1 + i - top, 0, f"{mark}{items[i]}", w - 1, curses.A_REVERSE if i == cur else 0)
+            stdscr.addnstr(2 + i - top, 0, f"{mark}{items[i]}", w - 1, curses.A_REVERSE if i == cur else 0)
         key = stdscr.getch()
         if key in (curses.KEY_UP, ord("k")):
             cur = max(0, cur - 1)
