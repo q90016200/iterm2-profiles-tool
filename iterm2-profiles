@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """備份／匯出／匯入 iTerm2 profiles（Preferences plist）與對應的登入腳本，支援同名覆蓋。"""
 import argparse
+import curses
 import difflib
 import json
+import locale
 import plistlib
 import shutil
 import subprocess
@@ -214,8 +216,41 @@ def parse_selection(text, n):
     return picked
 
 
+def _checklist(stdscr, names):
+    curses.curs_set(0)
+    sel, cur, top = [False] * len(names), 0, 0
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        stdscr.addnstr(0, 0, "↑↓ 移動  空白 勾選  a 全選/全不選  Enter 確認  q 取消", w - 1)
+        rows = max(1, h - 1)
+        top = min(max(top, cur - rows + 1), cur)
+        for i in range(top, min(len(names), top + rows)):
+            mark = "[x]" if sel[i] else "[ ]"
+            stdscr.addnstr(1 + i - top, 0, f"{mark} {names[i]}", w - 1, curses.A_REVERSE if i == cur else 0)
+        key = stdscr.getch()
+        if key in (curses.KEY_UP, ord("k")):
+            cur = max(0, cur - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            cur = min(len(names) - 1, cur + 1)
+        elif key == ord(" "):
+            sel[cur] = not sel[cur]
+        elif key == ord("a"):
+            sel = [not all(sel)] * len(names)
+        elif key in (10, 13, curses.KEY_ENTER):
+            return [n for n, on in zip(names, sel) if on]
+        elif key in (ord("q"), 27):
+            return []
+
+
 def choose_new_profiles(names):
-    """列出本機沒有的新 profile，讓使用者勾選（單選、多選、範圍、全選皆可），回傳選中的名稱。"""
+    """列出本機沒有的新 profile，用方向鍵＋空白勾選（單選、多選、全選皆可），回傳選中的名稱。
+    非 tty（pipe）時退回輸入編號。"""
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        locale.setlocale(locale.LC_ALL, "")
+        picked = curses.wrapper(_checklist, names)
+        print(f"已勾選 {len(picked)}/{len(names)} 個新 profile")
+        return picked
     print("\n以下 profile 本機沒有，可選擇要新增哪些：")
     for idx, name in enumerate(names, 1):
         print(f"  {idx}) {name}")
