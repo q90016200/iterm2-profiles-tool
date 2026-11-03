@@ -197,7 +197,36 @@ def cmd_export(domain, names, out_dir, script_dir):
     return zip_path
 
 
-def cmd_import(domain, bundle_dir, script_dir, confirm=None, skip_running_check=False):
+def parse_selection(text, n):
+    """「1 3-5」「a」（全選）、空白（全不選）→ 0 起算的編號集合；格式錯誤回傳 None。"""
+    text = text.strip().lower()
+    if text in ("a", "all"):
+        return set(range(n))
+    picked = set()
+    for tok in text.replace(",", " ").split():
+        lo, _, hi = tok.partition("-")
+        if not (lo.isdigit() and (not hi or hi.isdigit())):
+            return None
+        lo, hi = int(lo), int(hi or lo)
+        if not 1 <= lo <= hi <= n:
+            return None
+        picked.update(range(lo - 1, hi))
+    return picked
+
+
+def choose_new_profiles(names):
+    """列出本機沒有的新 profile，讓使用者勾選（單選、多選、範圍、全選皆可），回傳選中的名稱。"""
+    print("\n以下 profile 本機沒有，可選擇要新增哪些：")
+    for idx, name in enumerate(names, 1):
+        print(f"  {idx}) {name}")
+    while True:
+        picked = parse_selection(input("輸入編號（空格分隔，可用 1-3 範圍，a=全選，Enter=全不選）> "), len(names))
+        if picked is not None:
+            return [names[i] for i in sorted(picked)]
+        print("格式或編號無效，請重新輸入")
+
+
+def cmd_import(domain, bundle_dir, script_dir, confirm=None, skip_running_check=False, select_new=None):
     if bundle_dir.is_file() and bundle_dir.suffix == ".zip":
         tmp_dir = Path(tempfile.mkdtemp(prefix="iterm2-import-"))
         try:
@@ -206,7 +235,7 @@ def cmd_import(domain, bundle_dir, script_dir, confirm=None, skip_running_check=
             found = next(tmp_dir.rglob("profiles.json"), None)
             if found is None:
                 sys.exit(f"{bundle_dir}：zip 裡找不到 profiles.json，不是合法的 bundle")
-            return cmd_import(domain, found.parent, script_dir, confirm, skip_running_check)
+            return cmd_import(domain, found.parent, script_dir, confirm, skip_running_check, select_new)
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -223,6 +252,9 @@ def cmd_import(domain, bundle_dir, script_dir, confirm=None, skip_running_check=
     full_data, bookmarks = read_bookmarks(domain)
     changed = False
 
+    new_names = [n for n in dict.fromkeys(p.get("Name") for p in incoming) if find_bookmark(bookmarks, n) is None]
+    chosen = set((select_new or choose_new_profiles)(new_names)) if new_names else set()
+
     for profile in incoming:
         name = profile.get("Name")
         key, tracked = bundle_script_key(profile, script_dir)
@@ -236,6 +268,9 @@ def cmd_import(domain, bundle_dir, script_dir, confirm=None, skip_running_check=
 
         index = find_bookmark(bookmarks, name)
         if index is None:
+            if name not in chosen:
+                print(f"「{name}」：新 profile，未勾選，略過")
+                continue
             new_profile = dict(profile)
             new_profile.setdefault("Guid", str(uuid.uuid4()).upper())
             if tracked:
@@ -432,11 +467,22 @@ def selftest():
             bundle4.mkdir()
             (bundle4 / "profiles.json").write_text(json.dumps({"Profiles": [{"Name": "Personal"}]}))
             before_count = len(store[0]["New Bookmarks"])
-            cmd_import("fake", bundle4, script_dir, skip_running_check=True)
+            cmd_import("fake", bundle4, script_dir, skip_running_check=True, select_new=lambda ns: ns)
             assert len(store[0]["New Bookmarks"]) == before_count + 1
             personal = store[0]["New Bookmarks"][find_bookmark(store[0]["New Bookmarks"], "Personal")]
             assert len(personal["Guid"]) == 36 and personal["Guid"] == personal["Guid"].upper()
             assert find_bookmark(store[0]["New Bookmarks"], "Work") is not None
+
+            # 新 profile 勾選：只新增被選中的
+            bundle5 = Path(tmp) / "bundle-pick"
+            bundle5.mkdir()
+            (bundle5 / "profiles.json").write_text(json.dumps({"Profiles": [{"Name": "N1"}, {"Name": "N2"}, {"Name": "N3"}]}))
+            cmd_import("fake", bundle5, script_dir, skip_running_check=True, select_new=lambda ns: [ns[0], ns[2]])
+            bms = store[0]["New Bookmarks"]
+            assert find_bookmark(bms, "N1") is not None and find_bookmark(bms, "N3") is not None
+            assert find_bookmark(bms, "N2") is None
+            assert parse_selection("1 3-4", 4) == {0, 2, 3} and parse_selection("a", 3) == {0, 1, 2}
+            assert parse_selection("", 3) == set() and parse_selection("5", 3) is None and parse_selection("x", 3) is None
 
             # --script-dir 不同於來源時，Initial Text 要被改寫
             other_script_dir = Path(tmp) / "other-scripts"
