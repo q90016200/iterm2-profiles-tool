@@ -310,8 +310,7 @@ def cmd_import(domain, bundle_dir, script_dir, confirm=None, skip_running_check=
     full_data, bookmarks = read_bookmarks(domain)
     changed = False
 
-    new_names = [n for n in dict.fromkeys(p.get("Name") for p in incoming) if find_bookmark(bookmarks, n) is None]
-    chosen = set((select_new or choose_new_profiles)(new_names)) if new_names else set()
+    pending_new = []  # 本機沒有的新 profile：先處理完同名差異，最後再讓使用者勾選
 
     for profile in incoming:
         name = profile.get("Name")
@@ -326,19 +325,7 @@ def cmd_import(domain, bundle_dir, script_dir, confirm=None, skip_running_check=
 
         index = find_bookmark(bookmarks, name)
         if index is None:
-            if name not in chosen:
-                print(f"「{name}」：新 profile，未勾選，略過")
-                continue
-            new_profile = dict(profile)
-            new_profile.setdefault("Guid", str(uuid.uuid4()).upper())
-            if tracked:
-                new_profile = rewrite_initial_text(new_profile, key, script_dir)
-            bookmarks.append(new_profile)
-            if incoming_script is not None:
-                restore_to.parent.mkdir(parents=True, exist_ok=True)
-                restore_to.write_bytes(incoming_script)
-            changed = True
-            print(f"「{name}」：沒有同名 profile，已新增")
+            pending_new.append((profile, key, tracked, incoming_script, restore_to))
             continue
 
         old_profile = bookmarks[index]
@@ -368,6 +355,24 @@ def cmd_import(domain, bundle_dir, script_dir, confirm=None, skip_running_check=
             restore_to.write_bytes(incoming_script)
         changed = True
         print(f"「{name}」：已覆蓋（保留原 Guid）")
+
+    new_names = list(dict.fromkeys(p[0].get("Name") for p in pending_new))
+    chosen = set((select_new or choose_new_profiles)(new_names)) if new_names else set()
+    for profile, key, tracked, incoming_script, restore_to in pending_new:
+        name = profile.get("Name")
+        if name not in chosen:
+            print(f"「{name}」：新 profile，未勾選，略過")
+            continue
+        new_profile = dict(profile)
+        new_profile.setdefault("Guid", str(uuid.uuid4()).upper())
+        if tracked:
+            new_profile = rewrite_initial_text(new_profile, key, script_dir)
+        bookmarks.append(new_profile)
+        if incoming_script is not None:
+            restore_to.parent.mkdir(parents=True, exist_ok=True)
+            restore_to.write_bytes(incoming_script)
+        changed = True
+        print(f"「{name}」：沒有同名 profile，已新增")
 
     if not changed:
         print("沒有任何變更，略過寫回")
